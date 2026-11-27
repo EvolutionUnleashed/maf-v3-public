@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MAF V3",
+  "version": "3.0.0",
+  "identifier": "com.evolutionunleashed.mafv3",
+  "build": {
+    "frontendDist": "../desktop/shell"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "capabilities": ["main"]
+    },
+    "withGlobalTauri": false
+  },
+  "bundle": {
+    "active": true,
+    "useLocalToolsDir": true,
+    "targets": ["nsis"],
+    "category": "Business",
+    "copyright": "Copyright (c) 2026 Evolution Unleashed and Stu Jordan",
+    "shortDescription": "Research preview: a local, bring-your-own-AI content strategy workspace.",
+    "resources": {
+      "../LICENSE": "LICENSE.txt",
+      "../desktop/runtime/app/": "runtime/app/",
+      "../desktop/runtime/node/": "runtime/node/",
+      "../desktop/generated/THIRD-PARTY-NOTICES.txt": "THIRD-PARTY-NOTICES.txt"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

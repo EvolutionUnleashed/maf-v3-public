@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "artifacts": {
+    "nsisArchive": {
+      "url": "https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip",
+      "sha256": "c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1",
+      "size": 2361546
+    },
+    "nsisTauriUtils": {
+      "url": "https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll",
+      "sha256": "5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709",
+      "size": 34304
+    },
+    "webview2Bootstrapper": {
+      "url": "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/c507f2c4-84bc-4088-b85f-a08d995bc970/MicrosoftEdgeWebview2Setup.exe",
+      "sha256": "8c4a80540b6bbcbef30a4e8c7d1ac504b6fc09db922b4acdfd85c9d5f6f1050e",
+      "size": 1695960,
+      "authenticodeSubject": "CN=Microsoft Corporation"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+packages:
+  - .
+
+# Dependency versions are quarantined for seven full days. These settings
+# apply to direct and transitive packages, including entries already present
+# in pnpm-lock.yaml. New releases or metadata edits for other versions do not
+# reset the age of the exact, integrity-pinned version selected here.
+minimumReleaseAge: 10080
+minimumReleaseAgeStrict: true
+minimumReleaseAgeIgnoreMissingTime: false
+trustLockfile: false
+trustPolicy: no-downgrade
+# This historical semver release has weaker provenance than an earlier release.
+# Age, registry, and integrity gates still apply to this exact-version exception.
+trustPolicyExclude:
+  - "semver@6.3.1"
+blockExoticSubdeps: true
+
+# Narrow advisory fixes. Each resolved tarball must still pass the independent
+# exact-version age/integrity gate before installation. Do not override other majors.
+overrides:
+  "mammoth>@xmldom/xmldom": "0.8.15"
+  "qs@>=6 <6.16.0": "6.16.0"
+  "nanoid@>=3 <3.3.18": "3.3.18"
+  "@esbuild-kit/core-utils>esbuild": "0.25.10"
+  "vite>esbuild": "0.28.1"
+
+# New direct dependency declarations are written as exact versions. Existing
+# ranges in package.json must be migrated together with the lockfile.
+saveExact: true
+
+# Fail rather than silently run an unreviewed dependency lifecycle script.
+strictDepBuilds: true
+dangerouslyAllowAllBuilds: false
+allowBuilds:
+  "@tailwindcss/oxide": true
+  better-sqlite3: true
+  esbuild: true
+
+# Recheck store contents and refuse to auto-install when pnpm run detects a
+# stale node_modules tree.
+verifyStoreIntegrity: true
+strictStorePkgContentCheck: true
+verifyDepsBeforeRun: error
+preferFrozenLockfile: true
+updateNotifier: false

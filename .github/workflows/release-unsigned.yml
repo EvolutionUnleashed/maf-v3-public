@@ -1,0 +1,402 @@
+name: Build Windows handover installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build without signing identity
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Check out the exact triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify pnpm bootstrap before download
+        run: node scripts/security-verify-bootstrap.mjs
+
+      - name: Install pinned pnpm and Node without npm
+        uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
+        with:
+          version: 11.16.0
+          runtime: node@24.18.0
+          install: false
+          cache: false
+
+      - name: Confirm JavaScript toolchain pins
+        shell: pwsh
+        run: |
+          $pnpmVersion = pnpm --version
+          if ($LASTEXITCODE -ne 0 -or $pnpmVersion -ne "11.16.0") { throw "Unexpected pnpm version or version check failed" }
+          $nodeVersion = node --version
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne "v24.18.0") { throw "Unexpected Node version or version check failed" }
+
+      - name: Verify repository and npm dependency policy
+        run: node scripts/security-verify-config.mjs
+
+      - name: Verify every npm version before install
+        run: node scripts/security-verify-lock.mjs
+
+      - name: Verify every Rust crate before fetch
+        run: node scripts/security-verify-cargo-lock.mjs
+
+      - name: Install quarantined npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit known npm vulnerabilities
+        run: pnpm audit --audit-level=high
+
+      - name: Install the pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Pinned Rust toolchain installation failed" }
+          $actual = rustc +1.97.1 --version
+          if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^rustc 1\.97\.1 ') { throw "Unexpected Rust toolchain or version check failed: $actual" }
+
+      - name: Audit RustSec advisories
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ github.token }}
+          working-directory: src-tauri
+
+      - name: Fetch only the reviewed Cargo lockfile
+        run: cargo +1.97.1 fetch --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Generate deterministic third-party notices offline
+        run: node scripts/security-generate-notices.mjs
+
+      - name: Verify deterministic third-party notices
+        run: node scripts/security-generate-notices.mjs --check
+
+      - name: Type-check the application
+        run: pnpm check
+
+      - name: Test the application
+        run: pnpm test
+
+      - name: Build the portable application
+        run: pnpm build
+
+      - name: Prepare and smoke-test the isolated runtime
+        run: node scripts/desktop-prepare.mjs
+
+      - name: Verify the immutable OpenJS Node runtime signature
+        shell: pwsh
+        run: |
+          $node = Resolve-Path "desktop\runtime\node\node.exe"
+          $bundledNodeVersion = & $node --version
+          if ($LASTEXITCODE -ne 0 -or $bundledNodeVersion -ne "v24.18.0") { throw "Unexpected bundled Node version or version check failed" }
+          $signature = Get-AuthenticodeSignature -LiteralPath $node
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "The official bundled Node runtime signature is invalid"
+          }
+          if (-not $signature.SignerCertificate.Subject.StartsWith("CN=OpenJS Foundation", [StringComparison]::Ordinal)) {
+            throw "The bundled Node runtime does not have the reviewed OpenJS signer"
+          }
+
+      - name: Test the native Windows application
+        run: cargo +1.97.1 test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
+
+      - name: Prepare SHA-256-pinned Tauri bundler tools
+        shell: pwsh
+        run: .\scripts\security-prepare-tauri-tools.ps1
+
+      - name: Build unsigned Tauri application and installer
+        run: node node_modules/@tauri-apps/cli/tauri.js build --target x86_64-pc-windows-msvc --bundles nsis -- --locked
+
+      - name: Prove the Tauri tool cache was not changed during bundling
+        shell: pwsh
+        run: .\scripts\security-prepare-tauri-tools.ps1 -VerifyOnly
+
+      - name: Stage handover files
+        shell: pwsh
+        run: |
+          $release = Join-Path $env:GITHUB_WORKSPACE "release"
+          New-Item -ItemType Directory -Force -Path $release | Out-Null
+          $installers = @(Get-ChildItem "src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\*.exe" -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer" }
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $release
+          Copy-Item -LiteralPath QUICK-START.md, LICENSE, API-KEY-GUIDE.html, API-KEY-GUIDE.md, desktop\generated\THIRD-PARTY-NOTICES.txt -Destination $release -ErrorAction Stop
+          $pdfDirectory = Join-Path $release "output\pdf"
+          New-Item -ItemType Directory -Force -Path $pdfDirectory | Out-Null
+          Copy-Item -LiteralPath "output\pdf\MAF-V3-API-Setup-and-Safety-Guide.pdf" -Destination $pdfDirectory -ErrorAction Stop
+          Copy-Item -LiteralPath QUICK-START.md -Destination (Join-Path $release "START-HERE.txt")
+          @("MAF V3 - research preview, unsigned community handover", "Copyright (c) 2026 Evolution Unleashed and Stu Jordan", "Commit: ${env:GITHUB_SHA}", "Built: $([DateTime]::UtcNow.ToString('o'))", "No code signature or GitHub provenance attestation. Distributed as is under MIT, without warranty; see LICENSE. Start with API-KEY-GUIDE.html and QUICK-START.md.") |
+            Set-Content -LiteralPath (Join-Path $release "BUILD-INFO.txt") -Encoding utf8
+
+      - name: Generate SPDX JSON SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: release/maf-v3-${{ github.sha }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate SHA-256 checksums
+        run: node scripts/security-checksums.mjs release
+
+      - name: Upload short-lived unsigned candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-unsigned-${{ github.sha }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  clean-install-smoke:
+    name: Fresh-machine install, first-run, and uninstall
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Download the candidate from this build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-unsigned-${{ github.sha }}
+          path: candidate
+
+      - name: Verify all candidate checksums before execution
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path candidate).Path
+          $checksumPath = Join-Path $root "SHA256SUMS"
+          if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) { throw "SHA256SUMS is missing" }
+          $entries = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+          foreach ($line in Get-Content -LiteralPath $checksumPath) {
+            if ($line -notmatch '^([0-9a-f]{64})  ([^\r\n]+)$') { throw "Invalid checksum line" }
+            $expectedHash = $Matches[1]
+            $relative = $Matches[2]
+            if ([IO.Path]::IsPathRooted($relative) -or $relative.Split('/') -contains '..') {
+              throw "Unsafe checksum path"
+            }
+            if (-not $entries.TryAdd($relative, $expectedHash)) { throw "Duplicate checksum path" }
+            $file = [IO.Path]::GetFullPath((Join-Path $root $relative.Replace('/', '\')))
+            if (-not $file.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Checksum path escaped the candidate directory"
+            }
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Checksummed file is missing" }
+            $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $expectedHash) { throw "Candidate checksum mismatch" }
+          }
+          $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force |
+            Where-Object { $_.FullName -ne $checksumPath })
+          if ($entries.Count -ne $files.Count) { throw "Candidate has an unchecksummed file" }
+
+          foreach ($required in @("QUICK-START.md", "START-HERE.txt", "API-KEY-GUIDE.html", "API-KEY-GUIDE.md", "output/pdf/MAF-V3-API-Setup-and-Safety-Guide.pdf", "LICENSE", "THIRD-PARTY-NOTICES.txt", "BUILD-INFO.txt")) {
+            if (-not $entries.ContainsKey($required)) { throw "Required handover file missing from checksums: $required" }
+          }
+
+          $installers = @(Get-ChildItem -LiteralPath $root -Filter "*_x64-setup.exe" -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
+
+      - name: Install, launch first-run UI, verify SQLite, and uninstall
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath candidate -Filter "*_x64-setup.exe" -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
+
+          $installDirectory = Join-Path $env:LOCALAPPDATA "MAF V3"
+          $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MAF V3"
+          $dataDirectory = Join-Path $env:LOCALAPPDATA "com.evolutionunleashed.mafv3"
+          if ((Test-Path -LiteralPath $installDirectory) -or (Test-Path -LiteralPath $uninstallKey)) {
+            throw "The QA runner was not fresh before installation"
+          }
+
+          $installation = Start-Process -FilePath $installers[0].FullName -ArgumentList "/S" -WindowStyle Hidden -Wait -PassThru
+          if ($installation.ExitCode -ne 0) { throw "Silent current-user installation failed" }
+
+          $registration = Get-ItemProperty -LiteralPath $uninstallKey
+          $registeredLocation = ([string]$registration.InstallLocation).Trim('"')
+          if ($registeredLocation -cne $installDirectory) { throw "Installer registered an unexpected location" }
+
+          $application = Join-Path $installDirectory "maf-v3-desktop.exe"
+          $runtime = Join-Path $installDirectory "runtime"
+          $appRuntime = Join-Path $runtime "app"
+          $productLicense = Join-Path $installDirectory "LICENSE.txt"
+          $installedNotices = Join-Path $installDirectory "THIRD-PARTY-NOTICES.txt"
+          $runtimeNotices = Join-Path $appRuntime "THIRD-PARTY-NOTICES.txt"
+          $node = Join-Path $runtime "node\node.exe"
+          $database = Join-Path $dataDirectory "maf-v3.sqlite"
+          $requiredFiles = @(
+            $application,
+            $node,
+            $productLicense,
+            $installedNotices,
+            $runtimeNotices,
+            (Join-Path $appRuntime "desktop-runtime-manifest.json"),
+            (Join-Path $appRuntime "dist\index.js"),
+            (Join-Path $appRuntime "drizzle\meta\_journal.json"),
+            (Join-Path $appRuntime "node_modules\better-sqlite3\package.json")
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Installed runtime is incomplete" }
+          }
+          if ((Get-FileHash -LiteralPath $installedNotices -Algorithm SHA256).Hash -cne
+              (Get-FileHash -LiteralPath $runtimeNotices -Algorithm SHA256).Hash) {
+            throw "Installed third-party notices differ from the integrity-bound runtime copy"
+          }
+          if (-not (Select-String -LiteralPath $installedNotices -SimpleMatch "MAF V3 THIRD-PARTY NOTICES" -Quiet)) {
+            throw "Installed third-party notices have an unexpected format"
+          }
+
+          $marker = "qa-${env:GITHUB_RUN_ID}-${env:GITHUB_RUN_ATTEMPT}"
+          $appProcess = $null
+          try {
+            $appProcess = Start-Process -FilePath $application -PassThru
+            $deadline = [DateTime]::UtcNow.AddSeconds(90)
+            $windowReady = $false
+            while ([DateTime]::UtcNow -lt $deadline) {
+              Start-Sleep -Milliseconds 500
+              $appProcess.Refresh()
+              if ($appProcess.HasExited) { throw "Installed application exited during first run" }
+              $windowReady = $appProcess.MainWindowHandle -ne 0 -and $appProcess.MainWindowTitle -eq "MAF V3"
+              if ($windowReady -and (Test-Path -LiteralPath $database -PathType Leaf)) { break }
+            }
+            if (-not $windowReady) { throw "The first-run MAF V3 window did not open" }
+            if (-not (Test-Path -LiteralPath $database -PathType Leaf)) { throw "First run did not create SQLite" }
+            if (Test-Path -LiteralPath (Join-Path $dataDirectory "integrations.enc.json")) {
+              throw "A fresh install unexpectedly contained saved integrations"
+            }
+
+            $probe = @'
+          const Database = require("./node_modules/better-sqlite3");
+          const db = new Database(process.argv[1]);
+          const migrations = db.prepare("select count(*) c from __drizzle_migrations").get().c;
+          const tables = db.prepare("select count(*) c from sqlite_master where type='table' and name not like 'sqlite_%'").get().c;
+          if (migrations < 1 || tables < 2) process.exit(2);
+          db.exec("create table if not exists __maf_release_smoke(marker text primary key,value text not null)");
+          db.prepare("insert or replace into __maf_release_smoke(marker,value) values(?,?)").run(process.argv[2], "persists");
+          db.close();
+          '@
+            Push-Location $appRuntime
+            try { & $node -e $probe $database $marker } finally { Pop-Location }
+            if ($LASTEXITCODE -ne 0) { throw "Packaged Node, native SQLite, or migrations failed" }
+          } finally {
+            if ($null -ne $appProcess -and -not $appProcess.HasExited) {
+              $null = $appProcess.CloseMainWindow()
+              if (-not $appProcess.WaitForExit(10000)) { Stop-Process -Id $appProcess.Id -Force }
+            }
+            Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
+              Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installDirectory, [StringComparison]::OrdinalIgnoreCase) } |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+          }
+
+          $upgrade = Start-Process -FilePath $installers[0].FullName -ArgumentList "/S", "/UPDATE" -WindowStyle Hidden -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) { throw "Silent in-place reinstall failed" }
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "In-place reinstall damaged the runtime" }
+          }
+
+          $secondProcess = $null
+          try {
+            $secondProcess = Start-Process -FilePath $application -PassThru
+            $deadline = [DateTime]::UtcNow.AddSeconds(90)
+            $secondWindowReady = $false
+            while ([DateTime]::UtcNow -lt $deadline) {
+              Start-Sleep -Milliseconds 500
+              $secondProcess.Refresh()
+              if ($secondProcess.HasExited) { throw "Application exited after in-place reinstall" }
+              $secondWindowReady = $secondProcess.MainWindowHandle -ne 0 -and $secondProcess.MainWindowTitle -eq "MAF V3"
+              if ($secondWindowReady) { break }
+            }
+            if (-not $secondWindowReady) { throw "Second-launch MAF V3 window did not open" }
+
+            $persistenceProbe = @'
+          const Database = require("./node_modules/better-sqlite3");
+          const db = new Database(process.argv[1], { readonly: true });
+          const row = db.prepare("select value from __maf_release_smoke where marker=?").get(process.argv[2]);
+          const migrations = db.prepare("select count(*) c from __drizzle_migrations").get().c;
+          db.close();
+          if (!row || row.value !== "persists" || migrations < 1) process.exit(2);
+          '@
+            Push-Location $appRuntime
+            try { & $node -e $persistenceProbe $database $marker } finally { Pop-Location }
+            if ($LASTEXITCODE -ne 0) { throw "Database state did not persist across restart and in-place reinstall" }
+          } finally {
+            if ($null -ne $secondProcess -and -not $secondProcess.HasExited) {
+              $null = $secondProcess.CloseMainWindow()
+              if (-not $secondProcess.WaitForExit(10000)) { Stop-Process -Id $secondProcess.Id -Force }
+            }
+            Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
+              Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installDirectory, [StringComparison]::OrdinalIgnoreCase) } |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+          }
+
+          $durableStatePaths = @($database)
+          foreach ($relative in @("integrations.enc.json", ".config-encryption-key")) {
+            $candidate = Join-Path $dataDirectory $relative
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $durableStatePaths += $candidate }
+          }
+          $mediaDirectory = Join-Path $dataDirectory "media"
+          if (Test-Path -LiteralPath $mediaDirectory -PathType Container) {
+            $durableStatePaths += @(Get-ChildItem -LiteralPath $mediaDirectory -Recurse -File -Force |
+              Select-Object -ExpandProperty FullName)
+          }
+          $retainedState = @($durableStatePaths |
+            Sort-Object |
+            ForEach-Object {
+              $fullName = [string]$_
+              $relative = $fullName.Substring($dataDirectory.Length).TrimStart('\').Replace('\', '/')
+              "{0}  {1}" -f (Get-FileHash -LiteralPath $fullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
+            })
+          if ($retainedState.Count -eq 0) { throw "No local workspace state existed before uninstall" }
+
+          $uninstaller = Join-Path $installDirectory "uninstall.exe"
+          if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw "Uninstaller is missing" }
+          $removal = Start-Process -FilePath $uninstaller -ArgumentList "/S" -WindowStyle Hidden -Wait -PassThru
+          if ($removal.ExitCode -ne 0) { throw "Silent uninstall failed" }
+          $deadline = [DateTime]::UtcNow.AddSeconds(30)
+          while ([DateTime]::UtcNow -lt $deadline -and (Test-Path -LiteralPath $installDirectory)) {
+            Start-Sleep -Milliseconds 250
+          }
+          if ((Test-Path -LiteralPath $installDirectory) -or (Test-Path -LiteralPath $uninstallKey)) {
+            throw "Uninstall left application files or registration behind"
+          }
+          if (-not (Test-Path -LiteralPath $database -PathType Leaf)) {
+            throw "Uninstall unexpectedly deleted the user's local workspace"
+          }
+          $stateAfterUninstall = @($durableStatePaths |
+            Sort-Object |
+            ForEach-Object {
+              $fullName = [string]$_
+              if (-not (Test-Path -LiteralPath $fullName -PathType Leaf)) {
+                throw "Uninstall deleted durable user state"
+              }
+              $relative = $fullName.Substring($dataDirectory.Length).TrimStart('\').Replace('\', '/')
+              "{0}  {1}" -f (Get-FileHash -LiteralPath $fullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
+            })
+          if (Compare-Object -ReferenceObject $retainedState -DifferenceObject $stateAfterUninstall) {
+            throw "Uninstall changed the user's retained durable workspace files"
+          }
+          $expectedData = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "com.evolutionunleashed.mafv3"))
+          if ([IO.Path]::GetFullPath($dataDirectory) -cne $expectedData -or $dataDirectory -eq $env:LOCALAPPDATA) { throw "Unsafe QA cleanup target" }
+          Remove-Item -LiteralPath $dataDirectory -Recurse -Force
+
+      - name: Upload smoke-tested handover package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: MAF-V3-Windows-tested-${{ github.sha }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
